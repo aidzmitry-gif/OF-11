@@ -108,9 +108,8 @@ async def update_doc(
     elif payload.stage == "docs":
         events.emit_docs_collected(bus, session, obj)          # → Финансы
     elif payload.stage == "await_pay":
-        events.emit_payment_awaiting(bus, session, obj)        # → Финансы (+approval)
-        if (obj.overdue_days or 0) > events.OVERDUE_CLAIM_DAYS:
-            events.emit_payment_overdue(bus, session, obj)     # → Юрист
+        events.emit_payment_awaiting(bus, session, obj)        # → Финансы (+ кредитный риск)
+        events.escalate_overdue(bus, session, obj)             # лестница 5/15/30/45 (Юрист/РОП)
 
     await session.commit()
     await session.refresh(obj)
@@ -130,10 +129,20 @@ async def carrier_request(
     указывает направление и дату забора. Роут генерирует номер заявки
     ``ЛОГ-2026-NNNN``, фиксирует перевозчика в документе и эмитит
     ``logistics.delivery.requested`` → отдел Логистики.
+
+    Бизнес-правило: заявку можно создать только пока документ на стадии
+    «Готово к отгрузке» — нельзя заказывать доставку для уже отгруженного/
+    оплаченного документа (защита от двойной логистики).
     """
     obj = await session.get(OfficeDoc, doc_id)
     if obj is None:
         raise HTTPException(status_code=404, detail="Документ не найден")
+
+    if not events.is_ready_for_carrier(obj):
+        raise HTTPException(
+            status_code=409,
+            detail="Заявку перевозчику можно создать только на стадии «Готово к отгрузке»",
+        )
 
     carrier = get_carrier(payload.carrier)
     if carrier is None:
