@@ -2,12 +2,17 @@
 
 Офис-менеджер сидит в центре постпродажного контура и связан с пятью отделами:
 
-    CRM/Sales ──sales.deal.won──▶ ОФИС ──office.shipment.requested──▶ Склад
-                                    │
+    CRM/Sales ──sales.deal.won──▶ ОФИС
+                                    ├──office.reservation.requested──▶ Склад   (держать резерв под сделку)
+                                    ├──office.shipment.requested─────▶ Склад   (собрать/подготовить к отгрузке)
                                     ├──logistics.delivery.requested──▶ Логистика  (заявка перевозчику)
                                     ├──office.docs.collected─────────▶ Финансы
-                                    ├──office.payment.awaiting────────▶ Финансы    (+ approval при сумме > порога)
-                                    └──office.payment.overdue─────────▶ Юрист      (претензия при просрочке)
+                                    ├──office.payment.awaiting────────▶ Финансы    (+ кредитный риск при крупной сумме)
+                                    └──лестница просрочки дебиторки (ТЗ §4.2):
+                                          >5 дн  office.payment.reminder   (напоминание клиенту)
+                                          >15 дн office.claim.requested    ──▶ Юрист (претензия)
+                                          >30 дн office.lawsuit.requested  ──▶ Юрист (иск)
+                                          >45 дн office.payment.escalated  ──▶ Владелец/РОП (эскалация)
 
     Склад ──wms.shipment.completed──▶ ОФИС   (двигаем в «Отгружено»)
     Логистика ──logistics.delivery.delivered──▶ ОФИС   (трекинг доставки)
@@ -33,10 +38,16 @@ from modules.office.models import OfficeDoc
 
 logger = logging.getLogger("aios.office")
 
-# Порог суммы (BYN), выше которого оплата требует согласования (флаг для Финансов).
-APPROVAL_THRESHOLD = Decimal("10000")
-# Порог просрочки (дней), после которого долг уходит Юристу на претензию.
-OVERDUE_CLAIM_DAYS = 15
+# --- Пороги контроля дебиторской задолженности (ТЗ §4.2 · 5/15/30/45) ---
+OVERDUE_REMINDER_DAYS = 5     # > 5 дн  — напоминание клиенту
+OVERDUE_CLAIM_DAYS = 15       # > 15 дн — претензия (Юрист)
+OVERDUE_LAWSUIT_DAYS = 30     # > 30 дн — исковое заявление (Юрист)
+OVERDUE_ESCALATE_DAYS = 45    # > 45 дн — эскалация владельцу / РОП
+
+# Сумма дебиторки (BYN), выше которой документ помечается как кредитный риск
+# для Финансов/РОП. Это НЕ согласование исходящего платежа (та матрица —
+# у казначейства, ТЗ §4.2 «платёж свыше 10 000»), а контроль входящей задолженности.
+LARGE_RECEIVABLE_THRESHOLD = Decimal("10000")
 
 
 # --------------------------------------------------------------------------- #
@@ -65,6 +76,16 @@ def _doc_payload(doc: OfficeDoc, **extra: Any) -> dict:
 def emit_doc_created(bus, session: AsyncSession, doc: OfficeDoc) -> None:
     """Документ заведён в офисе (для аудита/дашборда владельца)."""
     bus.emit(session, "office.doc.created", _doc_payload(doc))
+
+
+def emit_reservation_requested(bus, session: AsyncSession, doc: OfficeDoc) -> None:
+    """→ Склад: поставить/держать резерв товара под выигранную сделку.
+
+    Резерв должен подтверждаться ДО запроса отгрузки, иначе сборка может уйти
+    в дефицит. В прототипе — событие-уведомление; подтверждение остатка из 1С/WMS
+    приходит обратно и обновляет документ (см. on_shipment_completed).
+    """
+    bus.emit(session, "office.reservation.requested", _doc_payload(doc))
 
 
 def emit_shipment_requested(bus, session: AsyncSession, doc: OfficeDoc) -> None:
@@ -109,22 +130,55 @@ def emit_docs_collected(bus, session: AsyncSession, doc: OfficeDoc) -> None:
 
 
 def emit_payment_awaiting(bus, session: AsyncSession, doc: OfficeDoc) -> None:
-    """→ Финансы: ожидаем оплату. Крупная сумма помечается на согласование."""
-    needs_approval = Decimal(str(doc.amount or 0)) > APPROVAL_THRESHOLD
+    """→ Финансы: ожидаем оплату. Крупная дебиторка помечается как кредитный риск."""
+    large_receivable = Decimal(str(doc.amount or 0)) > LARGE_RECEIVABLE_THRESHOLD
     bus.emit(
         session,
         "office.payment.awaiting",
-        _doc_payload(doc, needs_approval=needs_approval, threshold=float(APPROVAL_THRESHOLD)),
+        _doc_payload(
+            doc,
+            large_receivable=large_receivable,
+            threshold=float(LARGE_RECEIVABLE_THRESHOLD),
+        ),
     )
 
 
-def emit_payment_overdue(bus, session: AsyncSession, doc: OfficeDoc) -> None:
-    """→ Юрист: дебиторка просрочена сверх порога — основание для претензии."""
-    bus.emit(
-        session,
-        "office.payment.overdue",
-        _doc_payload(doc, overdue_days=doc.overdue_days, claim_days=OVERDUE_CLAIM_DAYS),
-    )
+# --- Лестница эскалации просрочки дебиторки (ТЗ §4.2: 5 / 15 / 30 / 45) ---
+def escalate_overdue(bus, session: AsyncSession, doc: OfficeDoc) -> str | None:
+    """Подобрать ступень эскалации по числу дней просрочки и эмитнуть событие.
+
+    В проде вызывается ежедневным планировщиком по всем неоплаченным документам;
+    в прототипе — при переходе в «Ожидают оплаты» по текущему ``overdue_days``.
+    Возвращает имя сработавшей ступени либо ``None``.
+    """
+    days = int(doc.overdue_days or 0)
+    if days > OVERDUE_ESCALATE_DAYS:
+        bus.emit(session, "office.payment.escalated", _doc_payload(doc, overdue_days=days, step="escalation"))
+        return "escalation"
+    if days > OVERDUE_LAWSUIT_DAYS:
+        bus.emit(session, "office.lawsuit.requested", _doc_payload(doc, overdue_days=days, step="lawsuit"))
+        return "lawsuit"
+    if days > OVERDUE_CLAIM_DAYS:
+        bus.emit(session, "office.claim.requested", _doc_payload(doc, overdue_days=days, step="claim"))
+        return "claim"
+    if days > OVERDUE_REMINDER_DAYS:
+        bus.emit(session, "office.payment.reminder", _doc_payload(doc, overdue_days=days, step="reminder"))
+        return "reminder"
+    return None
+
+
+def emit_payment_overdue(bus, session: AsyncSession, doc: OfficeDoc) -> str | None:
+    """Совместимость: делегирует в лестницу эскалации ``escalate_overdue``."""
+    return escalate_overdue(bus, session, doc)
+
+
+def is_ready_for_carrier(doc: OfficeDoc) -> bool:
+    """Можно ли вызывать перевозчика: документ на стадии «Готово к отгрузке».
+
+    Нельзя заказывать доставку для уже отгруженного/оплаченного документа —
+    это защищает от ошибочных заявок и двойной логистики.
+    """
+    return doc.stage == "ready"
 
 
 # --------------------------------------------------------------------------- #
@@ -156,7 +210,11 @@ async def _find_doc(session: AsyncSession, **by: str) -> OfficeDoc | None:
 
 
 async def on_deal_won(payload: dict, ctx) -> None:
-    """CRM: сделка выиграна → завести документ в стадии «Готово к отгрузке»."""
+    """CRM: сделка выиграна → завести документ в стадии «Готово к отгрузке».
+
+    Сразу ставим резерв на складе и просим собрать заказ — две разные команды
+    Складу (держать остаток и физически собрать).
+    """
     session: AsyncSession = ctx.session
     sales_ref = _first(payload, "deal_ref", "number", "deal_id", "entity_ref")
 
@@ -176,7 +234,7 @@ async def on_deal_won(payload: dict, ctx) -> None:
         sales_ref=sales_ref,
         stage="ready",
         docs_status="Ожидает отгрузки",
-        next_step="Передать на склад для сборки",
+        next_step="Поставить резерв и передать на склад для сборки",
     )
     session.add(doc)
     await session.flush()
@@ -185,7 +243,8 @@ async def on_deal_won(payload: dict, ctx) -> None:
 
     bus = ctx.services.event_bus
     emit_doc_created(bus, session, doc)
-    emit_shipment_requested(bus, session, doc)  # сразу просим Склад собрать заказ
+    emit_reservation_requested(bus, session, doc)  # держим остаток под сделку
+    emit_shipment_requested(bus, session, doc)      # просим Склад собрать заказ
     logger.info("office: создан %s по сделке %s", doc.number, sales_ref)
 
 
@@ -204,7 +263,7 @@ async def on_shipment_completed(payload: dict, ctx) -> None:
     doc.wms_ref = _first(payload, "wms_ref", "shipment_ref", default=doc.wms_ref)
     doc.stage = "shipped"
     doc.docs_status = "Отгружено, готовим документы"
-    doc.next_step = "Собрать пакет документов (ТТН, счёт-фактура, акт)"
+    doc.next_step = "Собрать пакет документов (ТТН, счёт-фактура, ЭСЧФ, акт)"
 
 
 async def on_delivery_delivered(payload: dict, ctx) -> None:
