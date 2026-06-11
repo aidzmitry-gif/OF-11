@@ -22,7 +22,7 @@ PERMISSIONS = [
 
 class OfficeModule(ModuleContract):
     name = "office"
-    version = "0.2.0"
+    version = "0.3.0"
     api_prefix = "/office"
 
     def register(self, core: Core) -> None:
